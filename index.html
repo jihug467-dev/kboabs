@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>KBO ABS - 고정밀 초고속 판정 시스템</title>
+    <style>
+        body {
+            margin: 0; padding: 0; font-family: 'Arial', sans-serif;
+            background-color: #121212; color: #ffffff;
+            display: flex; width: 100vw; height: 100vh; overflow: hidden;
+        }
+        #setup-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9); display: flex; flex-direction: column;
+            justify-content: center; align-items: center; z-index: 10;
+        }
+        #sidebar {
+            width: 25%; background-color: #1e1e1e; border-right: 2px solid #333;
+            padding: 15px; box-sizing: border-box; display: flex; flex-direction: column;
+            justify-content: space-between;
+        }
+        #main-stage {
+            width: 75%; position: relative; display: flex;
+            justify-content: center; align-items: center; background-color: #000;
+        }
+        video { display: none; }
+        canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .btn {
+            color: white; border: none; padding: 12px; font-size: 16px;
+            font-weight: bold; border-radius: 6px; cursor: pointer; margin-top: 10px;
+        }
+        #start-btn { background-color: #007bff; }
+        #start-btn:disabled { background-color: #555; }
+        .btn-record-start { background-color: #e63946; }
+        .btn-record-stop { background-color: #4a4e69; }
+        .status-box { background: #2a2a2a; padding: 12px; border-radius: 6px; margin-bottom: 10px; }
+        #judgement-overlay {
+            position: absolute; top: 15%; left: 50%; transform: translateX(-50%);
+            font-size: 80px; font-weight: bold; text-shadow: 4px 4px 8px rgba(0,0,0,1);
+            z-index: 5; pointer-events: none;
+        }
+        .strike-text { color: #ff3b30; }
+        .ball-text { color: #34c759; }
+        #rec-indicator {
+            position: absolute; top: 20px; right: 20px; background: rgba(230, 57, 70, 0.9);
+            padding: 6px 12px; border-radius: 4px; font-weight: bold; font-size: 14px;
+            display: none; animation: blink 1s infinite;
+        }
+        @keyframes blink { 50% { opacity: 0; } }
+    </style>
+    <script async src="https://docs.opencv.org/4.5.4/opencv.js" onload="onOpenCvReady();"></script>
+</head>
+<body>
+
+    <div id="setup-layer">
+        <h2>KBO ABS 빌더 (고정밀 판정 패치 버전)</h2>
+        <p id="status-text">OpenCV 그래픽 엔진을 로딩하고 있습니다...</p>
+        <button id="start-btn" class="btn" disabled onclick="initSystem()">시스템 시작</button>
+    </div>
+
+    <!-- 좌측 제어판 -->
+    <div id="sidebar">
+        <div>
+            <h3>🏆 대회 본부석</h3>
+            <div class="status-box">
+                <label>👤 타자 신장 설정 (140~170):</label>
+                <select id="player-select" onchange="updateStrikeZone()" style="width:100%; padding:8px; margin-top:5px; background:#333; color:white; border:1px solid #555; border-radius:4px;">
+                    <option value="140">타자 (140cm)</option>
+                    <option value="145">타자 (145cm)</option>
+                    <option value="150">타자 (150cm)</option>
+                    <option value="155">타자 (155cm)</option>
+                    <option value="160">타자 (160cm)</option>
+                    <option value="165">타자 (165cm)</option>
+                    <option value="170" selected>타자 (170cm)</option>
+                </select>
+            </div>
+
+            <!-- 현장 환경에 맞춰 수동 조절 가능한 감도 스위치 -->
+            <div class="status-box">
+                <label>🎛️ 테니스공 인식 감도 조절:</label>
+                <select id="sensitivity-select" style="width:100%; padding:8px; margin-top:5px; background:#333; color:white; border:1px solid #555; border-radius:4px;">
+                    <option value="normal" selected>보통 (실내/일반 야외)</option>
+                    <option value="high">높음 (흐린 날/어두운 곳)</option>
+                    <option value="wide">초고감도 (공이 아주 빠를 때)</option>
+                </select>
+            </div>
+            
+            <div class="status-box">
+                <h4>🔴 볼카운트</h4>
+                <div style="font-size: 24px; font-weight: bold; text-align: center;">
+                    B: <span id="cnt-ball" style="color:#34c759;">0</span> | S: <span id="cnt-strike" style="color:#ff3b30;">0</span> | O: <span id="cnt-out">0</span>
+                </div>
+            </div>
+        </div>
+        
+        <div style="display: flex; flex-direction: column; gap: 5px;">
+            <button id="rec-btn" class="btn btn-record-start" onclick="toggleRecording()">📹 경기 영상 녹화 시작</button>
+            <button class="btn" style="background:#555;" onclick="resetCount()">볼카운트 리셋</button>
+        </div>
+    </div>
+
+    <!-- 우측 메인 스크린 -->
+    <div id="main-stage">
+        <div id="rec-indicator">● REC 녹화중</div>
+        <div id="judgement-overlay"></div>
+        <video id="videoInput" playsinline></video>
+        <canvas id="canvasOutput"></canvas>
+    </div>
+
+    <script>
+        let video = document.getElementById('videoInput');
+        let canvas = document.getElementById('canvasOutput');
+        let ctx = canvas.getContext('2d');
+        let src, hsv, mask;
+        let isPlaying = false;
+
+        let balls = 0, strikes = 0, outs = 0;
+        let isJudging = false;
+        let zone = { left: 0, right: 0, top: 0, bottom: 0 };
+
+        // 궤적 및 유실 추적 메모리
+        let ballHistory = [];
+        let lastVelocity = { x: 0, y: 0 };
+        let missingFramesCount = 0;
+        const MAX_PREDICT_FRAMES = 12;
+
+        let mediaRecorder;
+        let recordedChunks = [];
+        let isRecording = false;
+
+        function onOpenCvReady() {
+            document.getElementById('status-text').innerText = "엔진 준비 완료! 가로 거치 후 시작하세요.";
+            document.getElementById('start-btn').disabled = false;
+        }
+
+        async function initSystem() {
+            document.getElementById('setup-layer').style.display = 'none';
+            const constraints = {
+                video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+                audio: false
+            };
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                video.play();
+                isPlaying = true;
+                
+                video.addEventListener('loadedmetadata', () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    src = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+                    hsv = new cv.Mat();
+                    mask = new cv.Mat();
+                    updateStrikeZone();
+                    requestAnimationFrame(processVideo);
+                });
+            } catch (err) {
+                alert("카메라 권한 오류: " + err.message);
+            }
+        }
+
+        // 가로 피팅 및 너무 작아 보이지 않도록 실제 체감 크기 보정 확장
+        function updateStrikeZone() {
+            const height = parseInt(document.getElementById('player-select').value);
+            const pixelScale = canvas.height / 320; // 스케일 인자 확대 보정
+            
+            // KBO 상하한선 기준을 시각적으로 알맞게 배치 보정
+            zone.top = Math.round(canvas.height - (height * pixelScale * 0.62)); 
+            zone.bottom = Math.round(canvas.height - (height * pixelScale * 0.24));
+            
+            // 실제 경기장 가로 폭을 고려해 9분할 존 크기를 기존보다 시원하게 확대 (width: 240px)
+            const zoneWidth = 240; 
+            zone.left = Math.round(canvas.width / 2 - (zoneWidth / 2));
+            zone.right = Math.round(canvas.width / 2 + (zoneWidth / 2));
+        }
+
+        function toggleRecording() {
+            const recBtn = document.getElementById('rec-btn');
+            const indicator = document.getElementById('rec-indicator');
+
+            if (!isRecording) {
+                recordedChunks = [];
+                let canvasStream = canvas.captureStream(30);
+                let options = { mimeType: 'video/mp4; codecs=vp9' };
+                if (!MediaRecorder.isTypeSupported(options.mimeType)) options = { mimeType: 'video/webm; codecs=vp8' };
+
+                try { mediaRecorder = new MediaRecorder(canvasStream, options); } catch (e) { mediaRecorder = new MediaRecorder(canvasStream); }
+                mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) recordedChunks.push(e.data); };
+                mediaRecorder.onstop = function() {
+                    let blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType });
+                    let url = URL.createObjectURL(blob);
+                    let a = document.createElement('a');
+                    a.href = url; a.download = `ABS_경기녹화.mp4`;
+                    document.body.appendChild(a); a.click();
+                    setTimeout(() => { document.body.removeChild(a); window.URL.revokeObjectURL(url); }, 100);
+                };
+                mediaRecorder.start(1000); isRecording = true;
+                recBtn.innerText = "🛑 경기 녹화 종료 및 저장"; recBtn.className = "btn btn-record-stop";
+                indicator.style.display = "block"; speak("녹화를 시작합니다");
+            } else {
+                mediaRecorder.stop(); isRecording = false;
+                recBtn.innerText = "📹 경기 영상 녹화 시작"; recBtn.className = "btn btn-record-start";
+                indicator.style.display = "none"; speak("녹화를 종료합니다");
+            }
+        }
+
+        function processVideo() {
+            if (!isPlaying) return;
+
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            let imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            src.data.set(imgData.data);
+
+            cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
+            cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+
+            // 🟢 현장 감도 설정에 따른 테니스공 색상 범위 매핑 분기 (인식 실패 패치)
+            let sensitivity = document.getElementById('sensitivity-select').value;
+            let lowRange = [26, 50, 50, 0];
+            let highRange = [74, 255, 255, 255];
+
+            if (sensitivity === "high") {
+                lowRange = [24, 35, 35, 0]; // 더 어두운 연두색도 포함
+            } else if (sensitivity === "wide") {
+                lowRange = [20, 20, 20, 0]; // 초고감도 센싱 알고리즘
+            }
+
+            let low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), lowRange);
+            let high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), highRange);
+            cv.inRange(hsv, low, high, mask);
+
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            let ballDetected = false;
+            let currentX = 0, currentY = 0, ballRadius = 0;
+
+            // 크기 필터링 완화 (공이 고속으로 날아와 작게 보일 때도 잡히도록 하한선을 3px로 낮춤)
+            for (let i = 0; i < contours.size(); ++i) {
+                let cnt = contours.get(i);
+                let circle = cv.minEnclosingCircle(cnt);
+                if (circle.radius > 3 && circle.radius < 45) {
+                    ballDetected = true;
+                    currentX = circle.center.x;
+                    currentY = circle.center.y;
+                    ballRadius = circle.radius;
+                    break;
+                }
+            }
+
+            // 🔲 9분할 가이드라인 드로잉
+            ctx.strokeStyle = "#00e5ff"; ctx.lineWidth = 4;
+            ctx.strokeRect(zone.left, zone.top, zone.right - zone.left, zone.bottom - zone.top);
+            ctx.strokeStyle = "rgba(0, 229, 255, 0.35)"; ctx.lineWidth = 2;
+            const colWidth = (zone.right - zone.left) / 3;
+            const rowHeight = (zone.bottom - zone.top) / 3;
+            for (let i = 1; i < 3; i++) {
+                ctx.beginPath(); ctx.moveTo(zone.left + (colWidth * i), zone.top); ctx.lineTo(zone.left + (colWidth * i), zone.bottom); ctx.stroke();
+            }
+            for (let j = 1; j < 3; j++) {
+                ctx.beginPath(); ctx.moveTo(zone.left, zone.top + (rowHeight * j)); ctx.lineTo(zone.right, zone.top + (rowHeight * j)); ctx.stroke();
+            }
+            ctx.fillStyle = "rgba(255, 255, 255, 0.2)"; ctx.fillRect(zone.left, zone.bottom, zone.right - zone.left, 8);
+
+            // 🎾 핵심 고속 판정 및 외삽 스캔 트리거
+            if (ballDetected) {
+                missingFramesCount = 0;
+                if (ballHistory.length > 0) {
+                    let prev = ballHistory[ballHistory.length - 1];
+                    lastVelocity.x = currentX - prev.x;
+                    lastVelocity.y = currentY - prev.y;
+                }
+                ballHistory.push({ x: currentX, y: currentY });
+                if (ballHistory.length > 8) ballHistory.shift();
+
+                ctx.beginPath(); ctx.arc(currentX, currentY, ballRadius, 0, 2 * Math.PI);
+                ctx.strokeStyle = "#ffeb3b"; ctx.lineWidth = 4; ctx.stroke();
+
+                // 판정 트리거 바운더리 검사
+                checkStrikeZone(currentX, currentY);
+            } else {
+                // 포수가 가리거나 공이 너무 빨라 프레임이 누락되었을 때의 복구 스캔
+                if (ballHistory.length >= 2 && missingFramesCount < MAX_PREDICT_FRAMES && !isJudging) {
+                    missingFramesCount++;
+                    let lastKnown = ballHistory[ballHistory.length - 1];
+                    let predictedX = lastKnown.x + (lastVelocity.x * missingFramesCount);
+                    let predictedY = lastKnown.y + (lastVelocity.y * missingFramesCount) + (0.4 * missingFramesCount);
+
+                    ctx.beginPath(); ctx.arc(predictedX, predictedY, 10, 0, 2 * Math.PI);
+                    ctx.strokeStyle = "#ff3b30"; ctx.setLineDash([3, 3]); ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
+
+                    checkStrikeZone(predictedX, predictedY);
+                } else if (!isJudging) {
+                    ballHistory = [];
+                }
+            }
+
+            contours.delete(); hierarchy.delete(); low.delete(); high.delete();
+            requestAnimationFrame(processVideo);
+        }
+
+        // 💥 판정이 잘 안 되는 문제를 해결한 '면적 트리거 스캔' 알고리즘
+        function checkStrikeZone(x, y) {
+            if (isJudging) return;
+
+            // 공이 판정 구역 근처(좌우 마진 40px 확장)를 통과하는 '그 찰나의 프레임'을 즉시 낚아챕니다.
+            if (x > (zone.left - 40) && x < (zone.right + 40) && y > (zone.top - 20) && y < (zone.bottom + 40)) {
+                if (x >= zone.left && x <= zone.right && y >= zone.top && y <= zone.bottom) {
+                    triggerDecision("strike");
+                } else {
+                    // 경계선을 벗어난 프레임이 확실히 잡히면 볼 처리
+                    if (y > zone.bottom || x < zone.left || x > zone.right || y < zone.top) {
+                        triggerDecision("ball");
+                    }
+                }
+            }
+        }
+
+        function triggerDecision(result) {
+            if (isJudging) return;
+            isJudging = true;
+
+            const overlay = document.getElementById('judgement-overlay');
+            if (result === "strike") {
+                overlay.innerHTML = "<span class='strike-text'>STRIKE!</span>";
+                addCount('strike'); speak("스트라이크");
+            } else {
+                overlay.innerHTML = "<span class='ball-text'>BALL</span>";
+                addCount('ball'); speak("볼");
+            }
+
+            setTimeout(() => { 
+                overlay.innerText = ""; isJudging = false; ballHistory = []; missingFramesCount = 0;
+            }, 1800); // 다음 투구를 위해 판정 인터벌 단축
+        }
+
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                let utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'ko-KR'; utterance.rate = 1.2;
+                window.speechSynthesis.speak(utterance);
+            }
+        }
+
+        function addCount(type) {
+            if (type === 'strike') {
+                strikes++; if (strikes >= 3) { strikes = 0; balls = 0; outs++; speak("삼진 아웃"); }
+            } else if (type === 'ball') {
+                balls++; if (balls >= 4) { strikes = 0; balls = 0; speak("볼 넷"); }
+            }
+            if (outs >= 3) { outs = 0; speak("공수 교대"); }
+            updateCountUI();
+        }
+
+        function resetCount() { balls = 0; strikes = 0; outs = 0; updateCountUI(); }
+        function updateCountUI() {
+            document.getElementById('cnt-ball').innerText = balls;
+            document.getElementById('cnt-strike').innerText = strikes;
+            document.getElementById('cnt-out').innerText = outs;
+        }
+    </script>
+</body>
+</html>
